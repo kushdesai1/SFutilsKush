@@ -2,7 +2,7 @@ public class describeee {
     public static void info(String objectName) {
         
         Schema.SObjectType objType = Schema.getGlobalDescribe().get(objectName);
-        
+        //trying git
         if (objType == null) {
             System.debug('Invalid object name: ' + objectName);
             return;
