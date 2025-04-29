@@ -19,7 +19,7 @@ public class describeee {
             
             System.debug('Field Name: ' + fieldName);
            // System.debug('  Label: ' + fieldDescribe.getLabel());
-           // System.debug('  Type: ' + fieldDescribe.getType());
+            System.debug('  Type: ' + fieldDescribe.getType());
            /* System.debug('  Length: ' + fieldDescribe.getLength());
             System.debug('  Precision: ' + fieldDescribe.getPrecision());
             System.debug('  Scale: ' + fieldDescribe.getScale());
