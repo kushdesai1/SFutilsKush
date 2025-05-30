@@ -1,0 +1,35 @@
+<template>
+    <h2>Contact Support</h2>
+    <template if:true={isLoading}>
+        <lightning-spinner alternative-text="Loading"></lightning-spinner>
+    </template>
+    <form onsubmit={handleSubmit}>
+        <lightning-input 
+            type="email" 
+            name="email" 
+            label="Email" 
+            value={email} 
+            required 
+            onchange={handleInputChange}>
+        </lightning-input>
+        <lightning-input 
+            type="text" 
+            name="subject" 
+            label="Subject" 
+            value={subject} 
+            required 
+            onchange={handleInputChange}>
+        </lightning-input>
+        <lightning-textarea 
+            name="description" 
+            label="Description" 
+            value={description} 
+            required 
+            onchange={handleInputChange}>
+        </lightning-textarea>
+        <br />
+        <div class="recaptchaInvisible"></div>
+        <br />
+        <lightning-button type="submit" label="Submit"></lightning-button>
+    </form>
+</template>
