@@ -1,12 +1,10 @@
 public class Logger {
     public static Boolean enableLogging;
 	    
-    // Getter method
     public static Boolean isLoggingEnabled() {
         return enableLogging;
     }
 
-    // Setter method
     public static void setLoggingEnabled(Boolean isEnabled) {
         enableLogging = isEnabled;
     }
@@ -21,7 +19,6 @@ public class Logger {
         }
     }
 
-    // Debug SObjects with field details
     public static void log(SObject record) {
         if (enableLogging) {
             System.debug(
@@ -32,7 +29,6 @@ public class Logger {
         }
     }
 
-    // Debug with custom message + variable
     public static void log(String message, Object value) {
         if (enableLogging) {
             log(message + ': ' + JSON.serializePretty(value));
