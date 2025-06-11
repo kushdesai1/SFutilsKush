@@ -1,0 +1,660 @@
+@RestResource(urlMapping='/auth/*')
+global with sharing class RST_Auth {
+
+  @HttpPost
+  global static ReturningResponse signUpOrLogin(AuthInfo authInfo) {
+    System.debug( 'RST_Auth.signUpOrLogin: ' + authInfo );
+    ReturningResponse retRes = new ReturningResponse();
+
+    try {
+      if (authInfo == null) {
+        retRes.errorInfoDeveloper = 'Missing arguments (authInfo).';
+        throw new ArgumentException(retRes.errorInfoDeveloper);
+      } else if (authInfo.usr == null) {
+        retRes.errorInfoDeveloper = 'Must define usr.';
+        throw new ArgumentException(retRes.errorInfoDeveloper);
+      }
+ 
+      if ( authInfo.isPiDevice == true ){
+        retRes = RST_AuthPi.handlePiAuthRequest(authInfo);
+      } else if ( authInfo.isLogin == true && authInfo.isSignup != true ) {
+        retRes = handleLogin(authInfo);
+      } else if ( authInfo.isSignup == true && authInfo.isLogin != true ) {
+        retRes = handleSignup(authInfo.usr);
+      } else if ( authInfo.isSignup != true && authInfo.isPreLogin == true ) {
+        return handlePreLogin(authInfo.usr);
+      }
+
+      if (retRes.success) {
+        retRes.accessToken = generateAccessToken(retRes.contactId);
+        
+        // Update FCM token if provided
+        if (authInfo.usr.fcmToken != null) {
+          updateFCMToken(retRes.contactId, authInfo.usr.fcmToken);
+        }
+        
+        retRes.user = [
+          SELECT
+            Id,
+            FirstName,
+            LastName,
+            Email,
+            Phone,
+            PushToken__c,
+            EmailVerified__c,
+            VerifyEmailToken__c,
+            EnergyZone__c,
+            gaugeId__c,
+            MainFuseSize__c,
+            AC_Coupled_Mode__c
+          FROM Contact
+          WHERE Id = :retRes.contactId
+          LIMIT 1
+        ];
+      }
+    } catch (Exception e) {
+      retRes.success = false;
+      retRes.errorInfoDeveloper = e + ' ' + e.getStackTraceString();
+      if( authInfo != null ){
+        ExceptionHandlingUtil.handleException('RST_Auth.signUpOrLogin', authInfo.toString(), e);
+      } else {
+        ExceptionHandlingUtil.handleException('RST_Auth.signUpOrLogin', null, e);
+      }
+    }
+    retres.errorInfoUser = (retRes.success == false &&
+      String.isEmpty(retRes.errorInfoUser))
+      ? 'Sorry, something went wrong. Please try again later.'
+      : retRes.errorInfoUser;
+    System.debug('Returning: '+retRes);
+    return retRes;
+  }
+
+  private static void updateFCMToken(String contactId, String fcmToken) {
+    try {
+        if (String.isBlank(contactId) || String.isBlank(fcmToken)) {
+            return;
+        }
+
+        List<Contact> existingContacts = [
+            SELECT Id, PushToken__c 
+            FROM Contact 
+            WHERE Id = :contactId 
+            LIMIT 1
+        ]; 
+
+        if (!existingContacts.isEmpty()) {
+            Contact contact = existingContacts[0];
+            if (contact.PushToken__c != fcmToken) {
+                contact.PushToken__c = fcmToken;
+                update contact;
+                System.debug('FCM Token updated for contact: ' + contactId);
+            }
+        }
+    } catch (Exception e) {
+        ExceptionHandlingUtil.handleException('RST_Auth.updateFCMToken', null, 
+            'Failed to update FCM token for contact ' + contactId + ': ' + e);
+    }
+}
+
+  private static ReturningResponse handlePreLogin(AppUser usr) {
+    System.debug( 'RST_Auth.handlePreLogin: ' + usr );
+    ReturningResponse retRes = new ReturningResponse();
+    List<Contact> conList;
+
+    if (!String.isEmpty(usr.email)) {
+      conList = [
+        SELECT Id, AppPassword__c, ForgotPasswordTokenExpiry__c
+        FROM Contact
+        WHERE Email = :usr.email
+        LIMIT 1
+      ];
+    } else if (!String.isEmpty(usr.resetPwdToken)) {
+      conList = [
+        SELECT Id, AppPassword__c, ForgotPasswordTokenExpiry__c
+        FROM Contact
+        WHERE ForgotPasswordToken__c = :usr.resetPwdToken
+        LIMIT 1
+      ];
+    }
+
+    if (conList.size() > 0) {
+      retRes.user = conList[0];
+    }
+
+    Long now = Datetime.now().getTime();
+    if (
+      retRes.user != null &&
+      !String.isEmpty(usr.resetPwdToken) &&
+      retRes.user.ForgotPasswordTokenExpiry__c != null &&
+      retRes.user.ForgotPasswordTokenExpiry__c.getTime() < now
+    ) {
+      retRes.user = null; // Do not return hash unneccessarily.
+      retRes.success = false;
+      retRes.errorInfoDeveloper = 'Expired';
+      retRes.errorInfoUser = 'Länken har expirerat.';
+      return retRes;
+    }
+
+    if (retRes.user != null) {
+      retRes.success = true;
+    } else {
+      retRes.success = false;
+      retRes.errorInfoDeveloper = 'Not found';
+      retRes.errorInfoUser = 'Fel email eller lösenord';
+    }
+    System.debug('Returning: '+retRes);
+    return retRes;
+  }
+
+
+  private static ReturningResponse handleLogin(AuthInfo authInfo) {
+    System.debug( 'RST_Auth.handleLogin: ' + authInfo );
+    AppUser usr = authInfo.usr;
+    ReturningResponse retRes = new ReturningResponse();
+    List<Contact> conList;
+    List<String> deviceIdList = new List<String>();
+    if (!(String.isEmpty(usr.deviceId) || String.isEmpty(usr.deviceOS))) {
+      if (authInfo.isTokenLogin == true && authInfo.tokenVerified == true) {
+        conList = [SELECT Id FROM Contact WHERE Id = :usr.contactId LIMIT 1];
+      } else {
+        if (!(String.isEmpty(usr.email) || String.isEmpty(usr.password))) {
+          conList = [
+            SELECT Id
+            FROM Contact
+            WHERE Email = :usr.email AND AppPassword__c = :usr.password
+            LIMIT 1
+          ];
+        } else {
+          retRes.errorInfoDeveloper = 'Must define email and password for usr.';
+        }
+      }
+      //match password
+      retRes.success = (conList != null && conList.size() > 0);
+      retRes.contactId = (retRes.success == true) ? conList[0].Id : null;
+
+      if (retRes.success == true) {
+        Id deviceIdSF;
+        Id juncId;
+        try {
+          deviceIdSF = createOrUpdateDevice(usr.deviceId, usr.deviceOs);
+          juncId = createOrGetJunction(retRes.contactId, deviceIdSF);
+        } catch (Exception e) {
+          retRes.success = false;
+          retRes.errorInfoDeveloper = 'Could not create device or junction.';
+          ExceptionHandlingUtil.handleException('RST_Auth.handleLogin 1', e.toString(), e);
+        }
+        if (deviceIdSF == null || juncId == null) {
+          retRes.success = false;
+          retRes.errorInfoDeveloper = 'Could not create device or junction.';
+        }
+      } else {
+          retRes.errorInfoUser = 'Wrong email or password.';        
+      }
+    } else {
+      retRes.errorInfoDeveloper = 'Must define deviceId and deviceOS for usr.';
+    }
+    return retRes;
+  }
+
+
+  private static ReturningResponse handleSignup(AppUser usr) {
+    System.debug( 'RST_Auth.handleSignup: ' + usr );
+    ReturningResponse retRes = new ReturningResponse();
+    Id conId;
+    System.debug('Request info:'+usr.toString());
+    
+    // Determine which version of the API is being used based on the presence of new fields
+    Boolean isNewVersion = usr.latitude != null || usr.longitude != null || !String.isEmpty(usr.gridOwnerName) || usr.spotPrice != null;
+    
+    // Only validate new fields if using the new version
+    if (isNewVersion) {
+      if (usr.latitude == null || usr.longitude == null) {
+        retRes.success = false;
+        retRes.errorInfoDeveloper = 'Latitude and Longitude are required.';
+        return retRes;
+      }
+      if (String.isEmpty(usr.gridOwnerName)) {
+        retRes.success = false;
+        retRes.errorInfoDeveloper = 'GridOwnerName is required.';
+        return retRes;
+      }
+      if (usr.spotPrice == null) {
+        retRes.success = false;
+        retRes.errorInfoDeveloper = 'SpotPrice is required.';
+        return retRes;
+      }
+      if (usr.spotPrice == true && usr.amount == null) {
+        retRes.success = false;
+        retRes.errorInfoDeveloper = 'Amount is required when SpotPrice is true.';
+        return retRes;
+      }
+    }
+    if (!(String.isEmpty(usr.deviceId) || String.isEmpty(usr.deviceOS))) {
+      if (!(String.isEmpty(usr.email) || String.isEmpty(usr.password))) {
+        List<Contact> conList = [
+          SELECT Id
+          FROM Contact
+          WHERE Email = :usr.email
+        ];
+        retRes.success = (conList.size() < 1);
+        if (retRes.success == true) {
+          conId = createNamedContact(usr);
+          retRes.contactId = conId;
+        } else { 
+          retRes.errorInfoUser = 'Email exists';
+        }
+      } else {
+        retRes.errorInfoDeveloper = 'Must define email or password for usr.';
+      }      
+      if (retRes.success == true && conId != null) {
+        Id deviceIdSF;
+        Id juncId;
+        try {
+          deviceIdSF = createOrUpdateDevice(usr.deviceId, usr.deviceOs);
+          juncId = createOrGetJunction(conId, deviceIdSF);
+        } catch (Exception e) {
+          retRes.success = false;
+          retRes.errorInfoDeveloper = 'Could not create device or junction.';
+          ExceptionHandlingUtil.handleException('RST_Auth.handleSignup 2', e.toString(), retRes.errorInfoDeveloper);
+        }
+        if (deviceIdSF == null || juncId == null) {
+          retRes.success = false; 
+          retRes.errorInfoDeveloper = 'Could not create device or junction.';
+        }
+      } else {
+        retRes.success = false;
+      }
+    } else {
+      retRes.errorInfoDeveloper = 'Must define deviceId and deviceOS for usr.';
+    }
+    return retRes;
+  }
+
+  //todo: fix this logic
+  public static Id createOrUpdateDevice(String deviceId, String deviceOs) {
+    System.debug( 'RST_Auth.createOrUpdateDevice: ' + deviceId+', ' + deviceOs);
+    String devOS = deviceOs.toLowerCase();
+    String devOSversion = (deviceOs.length() > 50)
+      ? deviceOs.substring(0, 50)
+      : deviceOs;
+    List<Device__c> deviceList = (!(String.isEmpty(deviceId) ||
+      String.isEmpty(deviceOs)))
+      ? [
+          SELECT Id, OS__c
+          FROM Device__c
+          WHERE deviceId__c = :deviceId 
+          LIMIT 1
+        ]// AND OS__c = :devOS
+      : new List<Device__c>();
+    Boolean deviceExists = (deviceList.size() > 0);
+    Device__c device = (deviceExists == true) ? deviceList[0] : new Device__c();
+    device.deviceId__c = deviceId;
+    device.OS__c = devOS;
+    device.OSversion__c = devOSversion;
+    if(devOS.contains('ras') || devOSversion.contains('ras')){
+      device.TypeOfDevice__c = 'PI';
+    }
+    upsert device;
+    return device.Id;
+  }
+
+
+  public static Id createOrGetJunction(Id conId, Id deviceIdSF) {
+    System.debug( 'RST_Auth.createOrGetJunction: ' + conId+', ' + deviceIdSF);
+    Id returnId;
+    List<DeviceContactJunction__c> devConJuncList = [
+      SELECT Id
+      FROM DeviceContactJunction__c
+      WHERE Device__r.Id = :deviceIdSF AND Contact__r.Id = :conId
+      LIMIT 1
+    ];
+    if (devConJuncList.size() < 1) {
+      DeviceContactJunction__c devConJunc = new DeviceContactJunction__c();
+      devConJunc.Contact__c = conId;
+      devConJunc.Device__c = deviceIdSF;
+      insert devConJunc;
+      returnId = devConJunc.Id;
+    } else {
+      returnId = devConJuncList[0].Id;
+    }
+    return returnId;
+  }
+
+
+  @testVisible
+  public static String generateAccessToken(String conId) {
+    System.debug( 'RST_Auth.generateAccessToken: ' + conId);
+
+    TokenSettings__mdt tokenSettings = TokenSettings__mdt.getInstance(
+      'Itaros_Proxy'
+    );
+    if(Test.isRunningTest()){
+      tokenSettings = RST_Auth_TST.getMetaData();
+    }
+    String aesType = tokenSettings.AESType__c;
+    String cryptoKeyBase64 = tokenSettings.CryptoKey__c;
+    Integer daysBeforeExpire = tokenSettings.DaysBeforeExpire__c.intValue();
+    String tokenDataString =
+      conId +
+      ':' +
+      String.valueOf(Datetime.now().addDays(daysBeforeExpire).getTime());
+
+    Blob tokenDataBlob = Blob.valueOf(tokenDataString);
+    Blob cryptoKeyBlob = EncodingUtil.base64Decode(cryptoKeyBase64);
+    Blob encryptedTokenBlob = Crypto.encryptWithManagedIV(
+      aesType,
+      cryptoKeyBlob,
+      tokenDataBlob
+    );
+    String encryptedTokenBase64 = EncodingUtil.base64Encode(encryptedTokenBlob);
+
+    return encryptedTokenBase64;   
+  }
+
+  /**
+   * OBS OBS: This method is to be removed!
+   */
+  @testVisible
+  public static Boolean isAccessTokenValid(String b64Token) {
+    System.debug( 'RST_Auth.isAccessTokenValid: ' + b64Token);
+
+    Boolean returnBool = false;
+    try {
+      TokenSettings__mdt tokenSettings = TokenSettings__mdt.getInstance(
+        'Itaros_Proxy'
+      );
+      if(Test.isRunningTest()){
+        tokenSettings = RST_Auth_TST.getMetaData();
+      }
+      String aesType = tokenSettings.AESType__c;
+      String cryptoKeyBase64 = tokenSettings.CryptoKey__c;
+      Integer daysBeforeExpire = tokenSettings.DaysBeforeExpire__c.intValue();
+
+      Blob encryptedTokenBlob = EncodingUtil.base64Decode(b64Token);
+      Blob cryptoKeyBlob = EncodingUtil.base64Decode(cryptoKeyBase64);
+      Blob decryptedTokenBlob = Crypto.decryptWithManagedIV(
+        aesType,
+        cryptoKeyBlob,
+        encryptedTokenBlob
+      );
+      String decryptedTokenBase64 = EncodingUtil.base64Encode(
+        decryptedTokenBlob
+      );
+      String decryptedTokenString = EncodingUtil.base64Decode(
+          decryptedTokenBase64
+        )
+        .toString();
+
+      System.debug('Decrypted: ' + decryptedTokenString);
+
+      String conId = decryptedTokenString.split(':')[0];
+      String expireTimeString = decryptedTokenString.split(':')[1];
+
+      Boolean contactExists = ([SELECT COUNT() FROM Contact WHERE Id = :conId] >
+      0);
+      Boolean notExpired = (Long.valueOf(expireTimeString) >
+      Datetime.now().getTime());
+      returnBool = (contactExists == true && notExpired == true);
+    } catch (Exception e) {
+      System.debug(e + ' ' + e.getStackTraceString());
+      returnBool = false;
+      ExceptionHandlingUtil.handleException('RST_Auth.isAccessTokenValid', null, e);
+    }
+    return returnBool;
+  }
+
+
+  @testVisible
+  public static String getContactIdFromAccessToken(String b64Token) {
+      System.debug( 'RST_Auth.getContactIdFromAccessToken: ' + b64Token);
+      
+      try {
+          TokenSettings__mdt tokenSettings = TokenSettings__mdt.getInstance( 'Itaros_Proxy' );
+          if(Test.isRunningTest()){
+              tokenSettings = RST_Auth_TST.getMetaData();
+          }
+          String aesType = tokenSettings.AESType__c;
+          String cryptoKeyBase64 = tokenSettings.CryptoKey__c;
+          Integer daysBeforeExpire = tokenSettings.DaysBeforeExpire__c.intValue();
+          
+          Blob encryptedTokenBlob = EncodingUtil.base64Decode(b64Token);
+          Blob cryptoKeyBlob = EncodingUtil.base64Decode(cryptoKeyBase64);
+          Blob decryptedTokenBlob = Crypto.decryptWithManagedIV( aesType, cryptoKeyBlob, encryptedTokenBlob );
+          String decryptedTokenBase64 = EncodingUtil.base64Encode( decryptedTokenBlob );
+          String decryptedTokenString = EncodingUtil.base64Decode( decryptedTokenBase64 ).toString();
+          
+          System.debug('Decrypted: ' + decryptedTokenString);
+          
+          String conId = decryptedTokenString.split(':')[0];
+          return conId;
+      } catch (Exception e) {
+          System.debug(e + ' ' + e.getStackTraceString());
+          ExceptionHandlingUtil.handleException('RST_Auth.getContactIdFromAccessToken', null, e);
+      }
+      return null;
+  }
+
+  public static final Integer ONE_DAY_IN_MILISECONDS = 86400000;
+  public static final Integer CRYPTO_KEY_STRENGTH = 256;
+
+  @testVisible
+  private static Id createNamedContact(AppUser usr) {
+    System.debug( 'RST_Auth.createNamedContact: ' + usr);
+
+    Contact con = new Contact();
+    con.FirstName = usr.firstName;
+    con.LastName = usr.lastName;
+    if (con.LastName == null) {
+      con.LastName = (usr.email.contains('@'))
+        ? usr.email.split('@')[0]
+        : usr.email;
+    }
+    con.Email = usr.email;
+    con.Phone = usr.phone;
+    con.EnergyZone__c = usr.energyZone;
+    con.AppPassword__c = usr.password; //handle password
+    
+    // Handle fields that might be in either version
+    if (usr.mainFuseSize != null) {
+      con.MainFuseSize__c = usr.mainFuseSize;
+    }
+    
+    if (usr.systemSize != null) {
+      con.systemSize__c = usr.systemSize;
+    }
+    
+    if (usr.gaugeId != null) {
+      con.gaugeId__c = usr.gaugeId;
+    }
+    
+    // Handle new version fields using dynamic field access to avoid errors if fields don't exist
+    Schema.DescribeSObjectResult contactDescribe = Schema.SObjectType.Contact;
+    Map<String, Schema.SObjectField> fieldMap = contactDescribe.fields.getMap();
+    
+    if (fieldMap.containsKey('Contactlocation__c') && usr.latitude != null) {
+        con.put('Contactlocation__Latitude__s', usr.latitude);
+    }
+    
+    if (fieldMap.containsKey('Contactlocation__c') && usr.longitude != null) {
+        con.put('Contactlocation__Longitude__s', usr.longitude);
+    }
+    
+    if (fieldMap.containsKey('GridOwnerName__c') && usr.gridOwnerName != null) {
+        con.put('GridOwnerName__c', usr.gridOwnerName);
+    }
+    
+    if (fieldMap.containsKey('SpotPrice__c') && usr.spotPrice != null) {
+        con.put('SpotPrice__c', usr.spotPrice);
+        
+        if (usr.spotPrice == true && fieldMap.containsKey('Amount__c') && usr.amount != null) {
+            con.put('Amount__c', usr.amount);
+        }
+    }
+    con.VerifyEmailExpiry__c = Datetime.newInstance(
+      Datetime.now().getTime() + ONE_DAY_IN_MILISECONDS
+    ); //24 Hour in ms
+    con.VerifyEmailToken__c = EncodingUtil.convertToHex(
+      Crypto.generateAesKey(CRYPTO_KEY_STRENGTH)  
+    );
+    insert con;
+    return con.Id;
+  }
+
+  // ----------------- Classes
+
+  global class AuthInfo {
+    public Boolean isLogin { get; set; }
+    public Boolean isSignup { get; set; }
+    public Boolean isTokenLogin { get; set; }
+    public Boolean isPreLogin { get; set; }
+    public Boolean tokenVerified { get; set; }
+    public Boolean isPiDevice { get; set; }
+    public AppUser usr { get; set; }
+  }
+
+  global class AppUser {
+    public String deviceId { get; set; }
+    public String deviceOS { get; set; }
+    public String energyZone { get; set; }
+    public String email { get; set; }
+    public String phone { get; set; }
+    public String password { get; set; }
+    public String contactId { get; set; }
+    public String accessToken { get; set; } 
+    public String resetPwdToken { get; set; }
+    public String username { get; set; }
+    public String firstName { get; set; }
+    public String lastName { get; set; }
+    public String profileStatus { get; set; }
+    public Decimal mainFuseSize { get; set; }
+    public String fcmToken { get; set; }
+    // Fields from previous version
+    public String gaugeId { get; set; }
+    public Decimal systemSize { get; set; }
+    // New fields for registration
+    public Decimal latitude { get; set; }
+    public Decimal longitude { get; set; }
+    public String gridOwnerName { get; set; }
+    public Boolean spotPrice { get; set; }
+    public Decimal amount { get; set; } // Only required if spotPrice is true
+  }
+
+  global class ReturningResponse {
+    public Boolean success { get; set; }
+    public String contactId { get; set; }
+    public String accessToken { get; set; }
+    public String errorInfoDeveloper { get; set; }
+    public String errorInfoUser { get; set; }
+    public Contact user { get; set; }
+  }
+
+  public class ArgumentException extends Exception {
+  }
+  
+}
+
+
+@IsTest
+public class RST_Auth_TST {
+
+  public static TokenSettings__mdt getMetaData(){
+    TokenSettings__mdt tokenSettings = new TokenSettings__mdt();
+    tokenSettings.AESType__c = 'AES256';
+    tokenSettings.CryptoKey__c = 'r0GLLhB8nRYjFGQX8f/NU1VJ9bRr65vDqTnedtusH7s=';
+    tokenSettings.DaysBeforeExpire__c = 4;
+    return tokenSettings;
+  }
+
+
+  @IsTest(SeeAllData=true)
+  static void signUpOrLogin_tst() {
+    Contact con = new Contact(LastName = 'LastName');
+    insert con;
+    RST_Auth.AuthInfo AuthInfo = new RST_Auth.AuthInfo();
+    AuthInfo.isLogin = true;
+    AuthInfo.isSignup = false;
+
+    RST_Auth.AppUser appUser = new RST_Auth.AppUser();
+    appUser.deviceId = 'devid';
+    appUser.deviceOS = 'iOS';
+    appUser.email = 'a@b.se';
+    appUser.phone = '0701';
+    appUser.password = 'password';
+    appUser.contactId = con.Id;
+    appUser.accessToken = RST_Auth.generateAccessToken(con.Id);
+
+    AuthInfo.usr = appUser;
+
+    Test.startTest();
+    RST_Auth.ReturningResponse res1 = RST_Auth.signUpOrLogin(AuthInfo);
+
+    AuthInfo.isLogin = false;
+    AuthInfo.isSignup = true;
+    RST_Auth.ReturningResponse res2 = RST_Auth.signUpOrLogin(AuthInfo);
+
+    AuthInfo.isLogin = false;
+    AuthInfo.isSignup = true;
+    RST_Auth.ReturningResponse res3 = RST_Auth.signUpOrLogin(AuthInfo);
+    Test.stopTest();
+  }
+
+  @IsTest
+  static void testAccessToken() {
+    Contact con1 = new Contact(Lastname = 'kontakt1');
+    insert con1;
+    String acceptedToken = con1.Id + ':' + (Datetime.now()).addHours(1).getTime();
+
+    String token = RST_Auth.generateAccessToken(acceptedToken);
+    boolean isValid = RST_Auth.isAccessTokenValid(token);
+
+    System.assertNotEquals(null, token, 'Could not generate a token');
+    System.assertEquals(true, isValid, 'Token is valid');
+  }
+
+  @IsTest
+  static void signUpOrLoginNoUser_tst() {
+    RST_Auth.AuthInfo AuthInfo = new RST_Auth.AuthInfo();
+    AuthInfo.isLogin = true;
+    AuthInfo.isSignup = false;
+    RST_Auth.ReturningResponse res4 = RST_Auth.signUpOrLogin(AuthInfo);
+    System.assert( res4.errorInfoDeveloper.contains('Must define usr'),
+      'Wrong error result returned (\''+res4.errorInfoDeveloper+'\')' );
+  }
+
+  @IsTest
+  static void signUpOrLoginNoInfo_tst() {
+    RST_Auth.ReturningResponse res4 = RST_Auth.signUpOrLogin(null);
+    System.assert( res4.errorInfoDeveloper.contains('Missing arguments (authInfo)'),
+      'Wrong error result returned (\''+res4.errorInfoDeveloper+'\')' );
+  }
+
+  @IsTest
+  static void createNamedContact() {
+    RST_Auth.AppUser appUser = new RST_Auth.AppUser();
+    appUser.deviceId = 'devid';
+    appUser.deviceOS = 'iOS';
+    appUser.email = 'a@b.se';
+    appUser.phone = '0701';
+    appUser.password = 'password';
+    appUser.lastName = 'Bertilsson';
+    appUser.firstName = 'Adam';
+
+    Id id = RST_Auth.createNamedContact(appUser);
+    System.assertNotEquals(null, id, 'No user created');
+  }
+
+  @IsTest
+  static void testGetContactIdFromAccessToken() {
+    Contact con1 = new Contact(Lastname = 'kontakt1');
+    insert con1;
+    String acceptedToken = con1.Id + ':' + (Datetime.now()).addHours(1).getTime();
+
+    String token = RST_Auth.generateAccessToken(acceptedToken);
+    String con = RST_Auth.getContactIdFromAccessToken(token);
+
+    System.assertNotEquals(null, con, 'No contact returned');
+  }
+
+}
+
+add some test method to increase the coverage
