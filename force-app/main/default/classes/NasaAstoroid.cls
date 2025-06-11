@@ -27,9 +27,12 @@ public with sharing class NasaAstoroid {
 
             for(NasaNeoFeedWrapper.NeoObject nobject: closelist)
 				{
-				system.debug('nobject.estimated_diameter ' + nobject.estimated_diameter);
-				system.debug('NeoObject.close_approach_data ' + nobject.close_approach_data); //WIP
-				//system.debug(nobject.estimated_diameter.estimated_diameter_max);
+				system.debug('nobject.estimated_diameter ' + nobject.estimated_diameter.kilometers.estimated_diameter_max);
+				system.debug('NeoObject.close_approach_data ' + nobject.close_approach_data); 
+				for (NasaNeoFeedWrapper.CloseApproachData cad : nobject.close_approach_data) {
+                            System.debug('Full Date: ' + cad.close_approach_date_full);
+                        }
+				
 
 				}
 			
