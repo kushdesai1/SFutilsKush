@@ -1,0 +1,75 @@
+public static void handleaerinsert(Map<Id, Case> updatedcases, Map<Id, Case> oldcases) {
+    Set<Id> accountids = new Set<Id>();
+
+    if (Trigger.isDelete) {
+        for (Case c : oldcases.values()) {
+            if (c.AccountId != null) {
+                accountids.add(c.AccountId);
+                System.debug('Account Ids in delete ' + accountids);
+            }
+        }
+    } else {
+        for (Case c : updatedcases.values()) {
+            if (Trigger.isBefore && Trigger.isUpdate && c.Cost__c == oldcases.get(c.Id).Cost__c) {
+                continue;
+            }
+
+            if (c.AccountId != null) {
+                accountids.add(c.AccountId);
+            }
+
+            if ((Trigger.isUpdate || Trigger.isUndelete) && c.AccountId != oldcases.get(c.Id).AccountId) {
+                if (oldcases.get(c.Id).AccountId != null) {
+                    accountids.add(oldcases.get(c.Id).AccountId);
+                }
+                if (updatedcases.get(c.Id).AccountId != null) {
+                    accountids.add(updatedcases.get(c.Id).AccountId);
+                }
+            }
+        }
+    }
+
+    if (accountids.isEmpty()) {
+        return;
+    }
+
+    Map<Id, Decimal> accountcostmap = new Map<Id, Decimal>();
+
+    for (Id accountid : accountids) {
+        accountcostmap.put(accountid, 0);
+    }
+
+    List<AggregateResult> agrlist = [
+        SELECT AccountId, SUM(Cost__c) total
+        FROM Case
+        WHERE AccountId IN :accountids
+        GROUP BY AccountId
+    ];
+    System.debug('Query' + agrlist);
+
+    if (agrlist.isEmpty()) {
+        for (Id accountid : accountids) {
+            accountcostmap.put(accountid, 0);
+        }
+    } else {
+        for (AggregateResult ar : agrlist) {
+            accountcostmap.put((Id)ar.get('AccountId'), (Decimal)ar.get('total'));
+        }
+    }
+
+    List<Account> accountsToUpdate = new List<Account>();
+    for (Id accountid : accountcostmap.keySet()) {
+        if (accountcostmap.get(accountid) != null) {
+            accountsToUpdate.add(new Account(Id = accountid, sumService__c = accountcostmap.get(accountid)));
+        } else {
+            accountsToUpdate.add(new Account(Id = accountid, sumService__c = 0.000));
+        }
+    }
+
+    if (!accountsToUpdate.isEmpty()) {
+        update accountsToUpdate;
+        System.debug('Accounts updated with sumService__c: ' + accountsToUpdate);
+    } else {
+        System.debug('No accounts to update.' + accountids + ' Accounts: ' + accountsToUpdate);
+    }
+}
